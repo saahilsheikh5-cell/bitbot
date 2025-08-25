@@ -1,5 +1,6 @@
-pyTelegramBotAPI
 flask
+pyTelegramBotAPI
 requests
-numpy
 pandas
+numpy
+
