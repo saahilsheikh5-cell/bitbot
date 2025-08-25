@@ -1,272 +1,209 @@
 import os
 import telebot
 import requests
-import pandas as pd
-import numpy as np
 import threading
 import time
-import json
+from flask import Flask, request
 from telebot import types
 
-# ================= CONFIG =================
-BOT_TOKEN = "7638935379:AAEmLD7JHLZ36Ywh5tvmlP1F8xzrcNrym_Q"
-CHAT_ID = 1263295916
-KLINES_URL = "https://api.binance.com/api/v3/klines"
-TOP_COINS_URL = "https://api.binance.com/api/v3/ticker/24hr"
+# === CONFIG ===
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://your-app.onrender.com/" + BOT_TOKEN)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
+app = Flask(__name__)
 
-# ================= STORAGE =================
-USER_COINS_FILE = "user_coins.json"
-SETTINGS_FILE = "settings.json"
-LAST_SIGNAL_FILE = "last_signals.json"
-MUTED_COINS_FILE = "muted_coins.json"
-COIN_INTERVALS_FILE = "coin_intervals.json"
+# === DATA STORAGE ===
+my_coins = []   # Stores user’s added coins (e.g. BTCUSDT, ETHUSDT)
+tracking = {}   # For signal tracking {"BTCUSDT": True}
 
-def load_json(file, default):
-    if not os.path.exists(file):
-        return default
-    with open(file, "r") as f:
-        return json.load(f)
+# === UTILS ===
+def normalize_symbol(symbol: str) -> str:
+    symbol = symbol.upper().strip()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    return symbol
 
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f)
-
-coins = load_json(USER_COINS_FILE, [])
-settings = load_json(SETTINGS_FILE, {"rsi_buy": 30, "rsi_sell": 70, "signal_validity_min": 15})
-last_signals = load_json(LAST_SIGNAL_FILE, {})
-muted_coins = load_json(MUTED_COINS_FILE, [])
-coin_intervals = load_json(COIN_INTERVALS_FILE, {})
-
-# ================= TECHNICAL ANALYSIS =================
-def get_klines(symbol, interval="15m", limit=100):
-    url = f"{KLINES_URL}?symbol={symbol}&interval={interval}&limit={limit}"
-    data = requests.get(url, timeout=10).json()
-    closes = [float(c[4]) for c in data]
-    return closes
-
-def rsi(data, period=14):
-    delta = np.diff(data)
-    gain = np.maximum(delta,0)
-    loss = -np.minimum(delta,0)
-    avg_gain = pd.Series(gain).rolling(period).mean()
-    avg_loss = pd.Series(loss).rolling(period).mean()
-    rs = avg_gain/avg_loss
-    return 100-(100/(1+rs))
-
-def ema(data, period=50):
-    return pd.Series(data).ewm(span=period).mean().values
-
-def macd(data, fast=12, slow=26, signal=9):
-    fast_ema = pd.Series(data).ewm(span=fast).mean()
-    slow_ema = pd.Series(data).ewm(span=slow).mean()
-    macd_line = fast_ema - slow_ema
-    signal_line = macd_line.ewm(span=signal).mean()
-    return macd_line.values, signal_line.values
-
-def generate_signal(symbol, interval):
+def get_binance_data(symbol: str, interval: str = "1m"):
     try:
-        closes = get_klines(symbol, interval)
-        if len(closes) < 30: return None
-        last_close = closes[-1]
-        rsi_val = rsi(closes)[-1]
-        ema50 = ema(closes)[-1]
-        macd_val, macd_signal = macd(closes)
-        macd_val = macd_val[-1]
-        macd_signal = macd_signal[-1]
-
-        if rsi_val < settings["rsi_buy"] and macd_val > macd_signal and last_close > ema50:
-            return f"🟢 ULTRA BUY {symbol} | RSI {rsi_val:.2f} | MACD {macd_val:.4f} | Price {last_close}"
-        elif rsi_val > settings["rsi_sell"] and macd_val < macd_signal and last_close < ema50:
-            return f"🔴 ULTRA SELL {symbol} | RSI {rsi_val:.2f} | MACD {macd_val:.4f} | Price {last_close}"
-        return None
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        return data
     except Exception as e:
-        print(f"Error generating signal for {symbol}: {e}")
+        print(f"[BINANCE] Error for {symbol} {interval}: {e}")
         return None
 
-# ================= SIGNAL MANAGEMENT =================
-auto_signals_enabled = True
-tracked_coin = None
+def technical_analysis(symbol: str, interval: str):
+    data = get_binance_data(symbol, interval)
+    if not data or isinstance(data, dict):
+        return f"⚠️ No data for {symbol} {interval}"
 
-def send_signal_if_new(coin, interval, sig):
-    global last_signals, muted_coins
-    if coin in muted_coins: return
-    key = f"{coin}_{interval}"
-    now_ts = time.time()
-    if key not in last_signals or now_ts - last_signals[key] > settings["signal_validity_min"]*60:
-        bot.send_message(CHAT_ID, f"⚡ {sig}")
-        last_signals[key] = now_ts
-        save_json(LAST_SIGNAL_FILE, last_signals)
+    closes = [float(x[4]) for x in data]
 
-def get_top_coins(n=50):
-    try:
-        data = requests.get(TOP_COINS_URL).json()
-        data = [d for d in data if "USDT" in d['symbol']]
-        sorted_data = sorted(data, key=lambda x: float(x['quoteVolume']), reverse=True)
-        return [d['symbol'] for d in sorted_data[:n]]
-    except:
-        return ["BTCUSDT","ETHUSDT","SOLUSDT"]
+    # RSI
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            losses.append(abs(diff))
+            gains.append(0)
+    avg_gain = sum(gains[-14:]) / 14
+    avg_loss = sum(losses[-14:]) / 14 if sum(losses[-14:]) > 0 else 1
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
 
-def signal_scanner():
-    while True:
-        if auto_signals_enabled:
-            active_coins = coins if coins else get_top_coins(50)
-            if tracked_coin:
-                active_coins.append(tracked_coin)
-            for c in active_coins:
-                intervals = coin_intervals.get(c, ["1m","5m","15m","1h"])
-                for interval in intervals:
-                    sig = generate_signal(c, interval)
-                    if sig:
-                        send_signal_if_new(c, interval, sig)
-        time.sleep(60)
+    # EMA (12 & 26)
+    def ema(prices, period):
+        k = 2 / (period + 1)
+        ema_values = [sum(prices[:period]) / period]
+        for price in prices[period:]:
+            ema_values.append((price * k) + ema_values[-1] * (1 - k))
+        return ema_values
 
-threading.Thread(target=signal_scanner, daemon=True).start()
+    ema12 = ema(closes, 12)[-1]
+    ema26 = ema(closes, 26)[-1]
 
-# ================= MARKUPS =================
-def main_menu_markup():
+    # MACD
+    macd = ema12 - ema26
+
+    # Decision
+    decision = "NEUTRAL"
+    if rsi < 30 and macd > 0:
+        decision = "BUY"
+    elif rsi > 70 and macd < 0:
+        decision = "SELL"
+
+    return f"📊 {symbol} {interval}\nRSI: {rsi:.2f}\nMACD: {macd:.4f}\nEMA12: {ema12:.2f}\nEMA26: {ema26:.2f}\n➡️ Signal: {decision}"
+
+# === BOT MENUS ===
+def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("➕ Add Coin","📊 My Coins")
-    markup.add("📈 Top Movers","📡 Signals")
-    markup.add("🛑 Stop Signals","🔄 Reset Settings")
-    markup.add("⚙️ Signal Settings","🔍 Preview Signal")
+    markup.add("➕ ADD COIN", "📊 MY COINS")
+    markup.add("📈 TOP MOVERS", "📡 SIGNALS")
+    markup.add("⏹ STOP", "🔄 RESET")
+    markup.add("⚙ SETTINGS", "👁 PREVIEW")
     return markup
 
-def back_markup():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("⬅️ Back")
-    return markup
-
-# ================= BOT COMMANDS =================
 @bot.message_handler(commands=["start"])
-def start(msg):
-    bot.send_message(msg.chat.id,"🤖 Welcome! Choose an option:", reply_markup=main_menu_markup())
+def start(message):
+    bot.send_message(message.chat.id, "👋 Welcome! Choose an option:", reply_markup=main_menu())
 
-# --- Add Coin ---
-@bot.message_handler(func=lambda m: m.text=="➕ Add Coin")
-def add_coin(msg):
-    bot.send_message(msg.chat.id,"Type coin symbol to add:", reply_markup=back_markup())
-    bot.register_next_step_handler(msg, process_add_coin)
+# === ADD COIN ===
+@bot.message_handler(func=lambda m: m.text == "➕ ADD COIN")
+def ask_coin(message):
+    msg = bot.send_message(message.chat.id, "Enter coin name (e.g. BTC, ETH):")
+    bot.register_next_step_handler(msg, save_coin)
 
-def process_add_coin(msg):
-    global coins
-    if msg.text=="⬅️ Back":
-        start(msg)
-        return
-    coin = msg.text.upper()
-    if coin not in coins:
-        coins.append(coin)
-        save_json(USER_COINS_FILE, coins)
-        bot.send_message(msg.chat.id,f"✅ {coin} added.", reply_markup=main_menu_markup())
-    else:
-        bot.send_message(msg.chat.id,f"{coin} already exists.", reply_markup=main_menu_markup())
-
-# --- My Coins ---
-@bot.message_handler(func=lambda m: m.text=="📊 My Coins")
-def my_coins_menu(msg):
-    if not coins:
-        bot.send_message(msg.chat.id,"⚠️ No coins saved.", reply_markup=main_menu_markup())
-        return
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    for c in coins: markup.add(c)
-    markup.add("⬅️ Back")
-    bot.send_message(msg.chat.id,"Select a coin:", reply_markup=markup)
-    bot.register_next_step_handler(msg, process_my_coin_selection)
-
-def process_my_coin_selection(msg):
-    if msg.text=="⬅️ Back":
-        start(msg)
-        return
-    coin = msg.text.upper()
-    if coin not in coins:
-        bot.send_message(msg.chat.id,"Coin not found.", reply_markup=main_menu_markup())
-        return
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    for t in ["1m","5m","15m","1h","1d"]: markup.add(t)
-    markup.add("⬅️ Back")
-    bot.send_message(msg.chat.id,f"Select timeframe for {coin}:", reply_markup=markup)
-    bot.register_next_step_handler(msg, lambda m: show_coin_analysis(coin, m))
-
-def show_coin_analysis(coin,msg):
-    if msg.text=="⬅️ Back":
-        my_coins_menu(msg)
-        return
-    interval = msg.text
-    sig = generate_signal(coin,interval)
-    if sig:
-        bot.send_message(msg.chat.id,f"📊 {coin} {interval} Analysis:\n{sig}", reply_markup=main_menu_markup())
-    else:
-        bot.send_message(msg.chat.id,f"No strong signals for {coin} in {interval}", reply_markup=main_menu_markup())
-
-# --- STOP SIGNALS ---
-@bot.message_handler(func=lambda m: m.text=="🛑 Stop Signals")
-def stop_signals_menu(msg):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    for c in coins: markup.add(c)
-    markup.add("⬅️ Back")
-    bot.send_message(msg.chat.id,"Select coin to stop signals:", reply_markup=markup)
-    bot.register_next_step_handler(msg, process_stop_signal)
-
-def process_stop_signal(msg):
-    global muted_coins
-    if msg.text=="⬅️ Back":
-        start(msg)
-        return
-    coin = msg.text.upper()
-    if coin not in muted_coins:
-        muted_coins.append(coin)
-        save_json(MUTED_COINS_FILE, muted_coins)
-    bot.send_message(msg.chat.id,f"⛔ Signals muted for {coin}", reply_markup=main_menu_markup())
-
-# --- RESET SETTINGS ---
-@bot.message_handler(func=lambda m: m.text=="🔄 Reset Settings")
-def reset_settings(msg):
-    global coins, last_signals, muted_coins, coin_intervals
-    coins=[]
-    last_signals={}
-    muted_coins=[]
-    coin_intervals={}
-    save_json(USER_COINS_FILE, coins)
-    save_json(LAST_SIGNAL_FILE, last_signals)
-    save_json(MUTED_COINS_FILE, muted_coins)
-    save_json(COIN_INTERVALS_FILE, coin_intervals)
-    bot.send_message(msg.chat.id,"🔄 All settings reset.", reply_markup=main_menu_markup())
-
-# --- SIGNAL SETTINGS ---
-@bot.message_handler(func=lambda m: m.text=="⚙️ Signal Settings")
-def signal_settings(msg):
-    bot.send_message(msg.chat.id,f"Current RSI Buy: {settings['rsi_buy']}, RSI Sell: {settings['rsi_sell']}\nSend new as: buy,sell")
-    bot.register_next_step_handler(msg, update_signal_settings)
-
-def update_signal_settings(msg):
+def save_coin(message):
     try:
-        parts = [int(x.strip()) for x in msg.text.split(",")]
-        settings["rsi_buy"]=parts[0]
-        settings["rsi_sell"]=parts[1]
-        save_json(SETTINGS_FILE, settings)
-        bot.send_message(msg.chat.id,"✅ Signal settings updated.", reply_markup=main_menu_markup())
-    except:
-        bot.send_message(msg.chat.id,"⚠️ Invalid format. Send as: buy,sell", reply_markup=main_menu_markup())
+        symbol = normalize_symbol(message.text)
+        if symbol not in my_coins:
+            my_coins.append(symbol)
+            bot.reply_to(message, f"✅ Added {symbol}")
+        else:
+            bot.reply_to(message, f"⚠️ {symbol} already in list")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {e}")
 
-# --- PREVIEW SIGNAL ---
-@bot.message_handler(func=lambda m: m.text=="🔍 Preview Signal")
-def preview_signal(msg):
-    active_coins = coins if coins else get_top_coins(50)
-    signals_list=[]
-    for c in active_coins:
-        intervals = coin_intervals.get(c, ["1m","5m","15m","1h"])
-        for interval in intervals:
-            sig = generate_signal(c, interval)
-            if sig: signals_list.append(sig)
-    if signals_list:
-        bot.send_message(msg.chat.id,"📡 Signals Preview:\n\n"+"\n".join(signals_list[:20]), reply_markup=main_menu_markup())
-    else:
-        bot.send_message(msg.chat.id,"⚡ No signals available.", reply_markup=main_menu_markup())
+# === MY COINS ===
+@bot.message_handler(func=lambda m: m.text == "📊 MY COINS")
+def show_my_coins(message):
+    if not my_coins:
+        bot.send_message(message.chat.id, "⚠️ No coins added.")
+        return
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for coin in my_coins:
+        markup.add(coin)
+    markup.add("🔙 BACK")
+    bot.send_message(message.chat.id, "📊 Select coin:", reply_markup=markup)
 
-# ================= START BOT =================
-if __name__=="__main__":
-    bot.infinity_polling()
+@bot.message_handler(func=lambda m: m.text in my_coins)
+def choose_timeframe(message):
+    coin = message.text
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for tf in ["1m", "5m", "15m", "1h", "4h", "1d"]:
+        markup.add(f"{coin} {tf}")
+    markup.add("🔙 BACK")
+    bot.send_message(message.chat.id, f"⏳ Select timeframe for {coin}:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: any(tf in m.text for tf in ["1m","5m","15m","1h","4h","1d"]))
+def show_analysis(message):
+    try:
+        parts = message.text.split()
+        coin, tf = parts[0], parts[1]
+        symbol = normalize_symbol(coin.replace("USDT", ""))
+        result = technical_analysis(symbol, tf)
+        bot.send_message(message.chat.id, result)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Error: {e}")
+
+# === SIGNALS ===
+@bot.message_handler(func=lambda m: m.text == "📡 SIGNALS")
+def ask_track_coin(message):
+    msg = bot.send_message(message.chat.id, "Enter coin to track (e.g. BTC):")
+    bot.register_next_step_handler(msg, start_tracking)
+
+def start_tracking(message):
+    symbol = normalize_symbol(message.text)
+    tracking[symbol] = True
+    bot.send_message(message.chat.id, f"📡 Tracking {symbol}... you’ll get alerts!")
+
+# === STOP ===
+@bot.message_handler(func=lambda m: m.text == "⏹ STOP")
+def stop_all(message):
+    tracking.clear()
+    bot.send_message(message.chat.id, "⏹ Stopped all signals.")
+
+# === RESET ===
+@bot.message_handler(func=lambda m: m.text == "🔄 RESET")
+def reset(message):
+    my_coins.clear()
+    tracking.clear()
+    bot.send_message(message.chat.id, "🔄 Reset done.")
+
+# === BACK BUTTON ===
+@bot.message_handler(func=lambda m: m.text == "🔙 BACK")
+def back_to_menu(message):
+    bot.send_message(message.chat.id, "🔙 Back to menu", reply_markup=main_menu())
+
+# === BACKGROUND SIGNAL CHECKER ===
+def signal_watcher():
+    while True:
+        try:
+            for symbol in list(tracking.keys()):
+                if tracking[symbol]:
+                    result = technical_analysis(symbol, "1m")
+                    if "BUY" in result or "SELL" in result:
+                        bot.send_message(chat_id=list(bot.get_updates()[-1].message.chat.id), text=f"🚨 Signal Alert\n{result}")
+            time.sleep(60)
+        except Exception as e:
+            print("[SIGNAL THREAD]", e)
+            time.sleep(10)
+
+threading.Thread(target=signal_watcher, daemon=True).start()
+
+# === FLASK WEBHOOK ===
+@app.route('/' + BOT_TOKEN, methods=['POST'])
+def webhook():
+    update = request.stream.read().decode("utf-8")
+    bot.process_new_updates([telebot.types.Update.de_json(update)])
+    return "OK", 200
+
+@app.route('/')
+def index():
+    return "Bot running!"
+
+if __name__ == "__main__":
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+
 
 
 
