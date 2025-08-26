@@ -1,6 +1,1 @@
-flask
-pyTelegramBotAPI
-requests
-pandas
-numpy
 
