@@ -1,32 +1,4 @@
-# final index.py - drop into your repo (bitbot)
-import os
-import json
-import time
-import threading
-import requests
-from flask import Flask, request
-import pandas as pd
-import numpy as np
-import telebot
-from telebot import types
 
-# ============= CONFIG =============
-# Hardcoded as requested (replace if you want env vars)
-BOT_TOKEN = "7638935379:AAEmLD7JHLZ36Ywh5tvmlP1F8xzrcNrym_Q"
-WEBHOOK_HOST = "https://bitbot.onrender.com"   # your render url
-WEBHOOK_URL = f"{WEBHOOK_HOST}/{BOT_TOKEN}"
-CRYPTOPANIC_KEY = "93eb38b2e64b3481bd12239e84f23738216a84109433ac772c3f37aeb38bc209"
-
-# Binance endpoints
-KLINES_URL = "https://api.binance.com/api/v3/klines"
-TICKER_24HR = "https://api.binance.com/api/v3/ticker/24hr"
-
-# Bot + Flask
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
-
-# ============= FILES & STORAGE =============
-DATA_DIR = "."
 USER_COINS_FILE = os.path.join(DATA_DIR, "user_coins.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 LAST_SIGNAL_FILE = os.path.join(DATA_DIR, "last_signals.json")
@@ -618,6 +590,7 @@ if __name__ == "__main__":
     set_webhook()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
